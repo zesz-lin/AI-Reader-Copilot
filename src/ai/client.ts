@@ -83,10 +83,27 @@ function buildPrompt(
   let system: string;
 
   if (style === 'custom' && customPrompt) {
-    // Use user's custom prompt, inject word count if not unlimited
-    system = customPrompt;
+    // Build the default prompt for the selected style as a base
+    const cfg = PROMPT_CFG[style];
+    system = `You are a reading assistant. Summarize the article in English using ${cfg.vocabLevel}.
+
+Output exactly two sections in Markdown:
+
+## Summary
+A flowing prose summary of the entire article.
+${cfg.summaryDepth}
+
+## Glossary
+- **Term**: Brief definition — only terms essential to understanding the article
+
+Rules: output only the Markdown, no preamble.`;
+
+    // Append custom prompt on top (higher priority)
+    let custom = customPrompt.replace(/\{wordCount\}/g, String(wordCount));
+    system += `\n\n## Custom Instructions (override defaults where they conflict)\n${custom}`;
+
+    // Append word limit if not unlimited
     if (wordCount > 0) {
-      system = system.replace(/\{wordCount\}/g, String(wordCount));
       system += `\n\n**Strictly limit the output to ${wordCount}–${Math.ceil(wordCount * 1.2)} words.**`;
     }
   } else {
