@@ -1,1 +1,1 @@
-export { generateSummary, generateSummaryStream, testConnection, PROVIDERS } from './client';
+export { generateSummaryStream, testConnection, PROVIDERS } from './client';

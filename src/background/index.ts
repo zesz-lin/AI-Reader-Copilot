@@ -1,10 +1,10 @@
 import type {
   AppMessage, AppResponse, SummaryResponse,
   ArticleRecordResponse, HistoryListResponse,
-  ArticleRecord, SidePanelMessage,
+  ArticleRecord, SidePanelMessage, SummaryStyle,
 } from '../shared';
 import { saveToHistory, getHistory, clearHistory, deleteFromHistory } from '../shared';
-import { generateSummary, generateSummaryStream } from '../ai';
+import { generateSummaryStream } from '../ai';
 
 
 // ── Language ──────────────────────────────────────────────────────────
@@ -65,11 +65,29 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => 
 chrome.commands.onCommand.addListener(async (command) => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
-  if (command === 'extract-article' || command === 'summarize-concise') {
+
+  if (command === 'extract-article') {
     chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_ARTICLE' }, () => void chrome.runtime.lastError);
-    if (command === 'summarize-concise' && lastArticle) {
-      streamSummaryToSidePanel('concise', 200, false, false);
-    }
+    return;
+  }
+
+  if (command === 'summarize-concise') {
+    // Send EXTRACT_ARTICLE and wait for the response before summarizing
+    chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_ARTICLE' }, (response) => {
+      if (chrome.runtime.lastError) return;
+      if (response?.status === 'ok' && response.article) {
+        // Update lastArticle with freshly extracted content
+        const sameUrl = lastArticle?.url === response.article.url;
+        lastArticle = {
+          url: response.article.url,
+          title: response.article.title,
+          summaryMarkdown: sameUrl ? lastArticle!.summaryMarkdown : null,
+          summaries: sameUrl ? { ...lastArticle!.summaries } : {},
+          rawText: response.article.textContent,
+        };
+        streamSummaryToSidePanel('concise', 200, false, false);
+      }
+    });
   }
 });
 
@@ -113,23 +131,43 @@ async function maybeTranslateTitle(title: string): Promise<void> {
     const baseUrl = (result.baseUrl as string) || 'https://api.deepseek.com/v1';
     const model = (result.model as string) || 'deepseek-reasoner';
 
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: 'Translate the following title to Chinese. Output only the translation, nothing else.' },
-          { role: 'user', content: title },
-        ],
-        temperature: 0,
-        max_tokens: 100,
-      }),
-    });
+    const anthropic = /\banthropic\.(com|net)\b/.test(baseUrl);
 
-    if (!res.ok) return;
-    const data = await res.json();
-    const translated = data.choices?.[0]?.message?.content?.trim();
+    let translated: string | undefined;
+
+    if (anthropic) {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model,
+          max_tokens: 100,
+          system: 'Translate the following title to Chinese. Output only the translation, nothing else.',
+          messages: [{ role: 'user', content: title }],
+          temperature: 0,
+        }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      translated = data.content?.[0]?.text?.trim();
+    } else {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: 'Translate the following title to Chinese. Output only the translation, nothing else.' },
+            { role: 'user', content: title },
+          ],
+          temperature: 0,
+          max_tokens: 100,
+        }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      translated = data.choices?.[0]?.message?.content?.trim();
+    }
     if (translated) {
       chrome.runtime.sendMessage<SidePanelMessage>({
         type: 'TITLE_TRANSLATED', translatedTitle: translated,
@@ -172,7 +210,7 @@ async function streamSummaryToSidePanel(style: string, wordCount: number, force:
 
     chrome.runtime.sendMessage<SidePanelMessage>({
       type: 'SUMMARY_CHUNK', content: '', done: true,
-      summaryMarkdown: fullContent, style: style as SidePanelMessage['style'],
+      summaryMarkdown: fullContent, style: style as SummaryStyle | undefined,
     }).catch(() => {});
 
     const s = style as 'concise' | 'detailed' | 'academic';
@@ -206,11 +244,6 @@ chrome.runtime.onMessage.addListener(
   (message: AppMessage, sender, sendResponse) => {
     switch (message.type) {
 
-      case 'PAGE_INFO': {
-        sendResponse({ status: 'ok' } satisfies AppResponse);
-        break;
-      }
-
       case 'ARTICLE_EXTRACTED': {
         lastArticle = {
           url: message.payload.url, title: message.payload.title,
@@ -227,11 +260,9 @@ chrome.runtime.onMessage.addListener(
       }
 
       case 'NO_ARTICLE_FOUND': {
-        // All content-script tiers failed — redirect to archive.ph
         const url = message.url;
         if (lastArticle?.url === url) lastArticle = null;
         sendResponse({ status: 'ok' } satisfies AppResponse);
-        redirectToArchive(url);
         break;
       }
 
@@ -293,8 +324,6 @@ chrome.runtime.onMessage.addListener(
                 sendResponse({ status: 'ok', article: lastArticle });
               } else {
                 sendResponse({ status: 'error', error: response?.error || '提取失败\nExtraction failed.' });
-                // Also redirect to archive.ph
-                if (tab.url) redirectToArchive(tab.url);
               }
             });
           } catch (err) {
@@ -307,21 +336,21 @@ chrome.runtime.onMessage.addListener(
       case 'SAVE_TO_HISTORY': {
         saveToHistory(message.payload)
           .then((entries) => sendResponse({ status: 'ok', entries } satisfies HistoryListResponse))
-          .catch((err) => sendResponse({ status: 'error', error: humanError(err) } satisfies HistoryListResponse));
+          .catch((err) => sendResponse({ status: 'error', error: humanError(err), entries: [] } satisfies HistoryListResponse));
         return true;
       }
 
       case 'GET_HISTORY': {
         getHistory()
           .then((entries) => sendResponse({ status: 'ok', entries } satisfies HistoryListResponse))
-          .catch((err) => sendResponse({ status: 'error', error: humanError(err) } satisfies HistoryListResponse));
+          .catch((err) => sendResponse({ status: 'error', error: humanError(err), entries: [] } satisfies HistoryListResponse));
         return true;
       }
 
       case 'CLEAR_HISTORY': {
         clearHistory()
           .then(() => sendResponse({ status: 'ok', entries: [] } satisfies HistoryListResponse))
-          .catch((err) => sendResponse({ status: 'error', error: humanError(err) } satisfies HistoryListResponse));
+          .catch((err) => sendResponse({ status: 'error', error: humanError(err), entries: [] } satisfies HistoryListResponse));
         return true;
       }
 
@@ -341,7 +370,7 @@ chrome.runtime.onMessage.addListener(
       case 'DELETE_HISTORY_ENTRY': {
         deleteFromHistory(message.id)
           .then((entries) => sendResponse({ status: 'ok', entries } satisfies HistoryListResponse))
-          .catch((err) => sendResponse({ status: 'error', error: humanError(err) } satisfies HistoryListResponse));
+          .catch((err) => sendResponse({ status: 'error', error: humanError(err), entries: [] } satisfies HistoryListResponse));
         return true;
       }
 

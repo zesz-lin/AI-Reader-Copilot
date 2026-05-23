@@ -23,24 +23,17 @@ const PAYWALL_SELECTORS = [
   '.comments-section', '.comment-section', '#comments',
 ];
 
-const MIN_CONTENT_LENGTH = 300;
-
-export function removePaywallElements(doc: Document): number {
-  let removed = 0;
-
+export function removePaywallElements(doc: Document): void {
   for (const selector of PAYWALL_SELECTORS) {
     try {
       const elements = doc.querySelectorAll(selector);
       for (const el of elements) {
         el.remove();
-        removed++;
       }
     } catch {
       // invalid selector, skip
     }
   }
-
-  return removed;
 }
 
 /**
@@ -113,10 +106,4 @@ export function unhidePaywalledContent(doc: Document): void {
   }
 }
 
-export function contentLength(doc: Document): number {
-  return (doc.body?.textContent || '').trim().length;
-}
 
-export function isContentTooShort(doc: Document): boolean {
-  return contentLength(doc) < MIN_CONTENT_LENGTH;
-}

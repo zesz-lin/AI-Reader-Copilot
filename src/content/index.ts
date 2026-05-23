@@ -1,5 +1,4 @@
 import type {
-  PageInfoMessage,
   ArticleExtractedMessage,
   NoArticleFoundMessage,
   AppResponse,
@@ -9,18 +8,6 @@ import { extractArticle, extractArticleAggressive } from '../readability/parser'
 
 const MIN_TEXT_LENGTH = 300;
 const RETRY_DELAY = 2500;
-
-// ── Page info ──────────────────────────────────────────────────────────
-
-function sendPageInfo(): void {
-  chrome.runtime
-    .sendMessage<PageInfoMessage, AppResponse>({
-      type: 'PAGE_INFO',
-      payload: { url: window.location.href, title: document.title },
-      timestamp: Date.now(),
-    })
-    .catch(() => {});
-}
 
 function sendArticle(article: { title: string; textContent: string; content: string; excerpt?: string; byline?: string }): void {
   chrome.runtime
@@ -61,10 +48,7 @@ async function extractWithFallback(): Promise<void> {
   console.log('[ai-reader-copilot] Tier 1 short (%d chars), waiting for delayed content...',
     article?.textContent.length ?? 0);
 
-  if (article) {
-    // Send what we have, but also retry
-    sendArticle(article);
-  }
+  // Don't send Tier 1 partial result — wait for Tier 2
 
   // Tier 2: wait for JS-loaded content, then aggressive extraction
   await sleep(RETRY_DELAY);
@@ -115,5 +99,4 @@ chrome.runtime.onMessage.addListener(
 
 // ── Bootstrap ──────────────────────────────────────────────────────────
 
-sendPageInfo();
 extractWithFallback();

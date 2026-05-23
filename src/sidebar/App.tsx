@@ -44,6 +44,9 @@ export default function App() {
   const [wordCount, setWordCount] = useState(200);
   const [customPrompt, setCustomPrompt] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
+  const pausedContentRef = useRef('');
+  const streamPausedRef = useRef(streamPaused);
+  useEffect(() => { streamPausedRef.current = streamPaused; }, [streamPaused]);
 
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('https://api.deepseek.com/v1');
@@ -95,22 +98,43 @@ export default function App() {
     function listener(message: SidePanelMessage) {
       if (message.type === 'SUMMARY_CHUNK') {
         if (message.done) {
+          // If stream finished while paused, use summaryMarkdown directly
+          // (background was never aborted — it contains the complete content)
+          if (streamPausedRef.current) {
+            if (message.summaryMarkdown) {
+              setArticle((prev) => prev ? {
+                ...prev,
+                summaryMarkdown: message.summaryMarkdown!,
+                summaries: { ...prev.summaries, [cacheKey]: message.summaryMarkdown! },
+              } : null);
+            } else {
+              setStatus('error'); setError(t('aiEmpty'));
+            }
+            return;
+          }
+
+          // Normal done handling
           if (message.summaryMarkdown) {
             const style = (message.style as SummaryStyle) || 'concise';
+            // Merge with paused content if this was a continued stream
+            const prefix = pausedContentRef.current;
+            const fullSummary = prefix ? prefix + message.summaryMarkdown : message.summaryMarkdown!;
             setArticle((prev) => prev ? {
               ...prev,
-              summaryMarkdown: message.summaryMarkdown!,
-              summaries: { ...prev.summaries, [cacheKey]: message.summaryMarkdown! },
+              summaryMarkdown: fullSummary,
+              summaries: { ...prev.summaries, [cacheKey]: fullSummary },
             } : null);
+            setPausedContent('');
+            pausedContentRef.current = '';
             setStatus('done'); refreshHistory();
           } else { setStatus('error'); setError(t('aiEmpty')); }
         } else { setStreamContent((prev) => prev + message.content); }
         return;
       }
       if (message.type === 'ARCHIVE_STATUS') {
-        if (message.status === 'fetching') { setError('正在从 archive.ph 获取...'); }
+        if (message.status === 'fetching') { setError(t('archiveFetching')); }
         else if (message.status === 'done' && message.article) { setArticle(message.article); setStatus('article-ready'); setError(null); }
-        else if (message.status === 'error') { setError('archive.ph 无法获取该页面内容'); }
+        else if (message.status === 'error') { setError(t('archiveFail')); }
       }
       if (message.type === 'TITLE_TRANSLATED') {
         setTranslatedTitle(message.translatedTitle);
@@ -146,7 +170,7 @@ export default function App() {
     setStatus('summarizing'); setError(null); setCacheHit(false); setStreamContent(''); setStreamPaused(false); setPausedContent('');
     try {
       const res = await chrome.runtime.sendMessage<
-        { type: string; style: SummaryStyle; wordCount: number; force?: boolean; bilingual?: boolean }, SummaryResponse
+        { type: string; style: SummaryStyle; wordCount: number; customPrompt?: string; force?: boolean; bilingual?: boolean }, SummaryResponse
       >({ type: 'GENERATE_SUMMARY', style: activeStyle, wordCount: wordCount === -1 ? 0 : wordCount, customPrompt, force, bilingual });
       if (res?.status === 'ok' && res.cached) {
         setArticle((prev) => prev ? { ...prev, summaryMarkdown: res.summaryMarkdown!, summaries: { ...prev.summaries, [cacheKey]: res.summaryMarkdown! } } : null);
@@ -157,29 +181,28 @@ export default function App() {
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); setStatus('error'); }
   }, [activeStyle, wordCount, bilingual, cacheKey, t]);
 
-  const handlePauseStream = useCallback(async () => {
+  const handlePauseStream = useCallback(() => {
     setPausedContent(streamContent);
-    await chrome.runtime.sendMessage({ type: 'STOP_STREAMING' });
+    pausedContentRef.current = streamContent;
     setStreamPaused(true);
     setStatus('done');
   }, [streamContent]);
 
-  const handleContinue = useCallback(async () => {
-    // Keep pausedContent, only clear new stream state
-    setStatus('summarizing'); setError(null); setCacheHit(false);
-    setStreamContent(''); setStreamPaused(false);
-    try {
-      const res = await chrome.runtime.sendMessage<
-        { type: string; style: SummaryStyle; wordCount: number; customPrompt?: string; force?: boolean; bilingual?: boolean }, SummaryResponse
-      >({ type: 'GENERATE_SUMMARY', style: activeStyle, wordCount: wordCount === -1 ? 0 : wordCount, customPrompt, force: true, bilingual });
-      if (res?.status === 'ok' && res.cached) {
-        setArticle((prev) => prev ? { ...prev, summaryMarkdown: res.summaryMarkdown!, summaries: { ...prev.summaries, [cacheKey]: res.summaryMarkdown! } } : null);
-        setCacheHit(true); setStatus('done'); setPausedContent('');
-      } else if (res?.status === 'ok' && res.streaming) {
-        setStatus('summarizing');
-      } else { setError(res?.error || t('summaryFail')); setStatus('error'); setPausedContent(''); }
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); setStatus('error'); }
-  }, [activeStyle, wordCount, customPrompt, bilingual, cacheKey, t]);
+  const handleContinue = useCallback(() => {
+    // If stream already finished while paused, just show the final article
+    if (article?.summaries?.[cacheKey] || article?.summaryMarkdown) {
+      setStatus('done');
+      setStreamPaused(false);
+      setPausedContent('');
+      pausedContentRef.current = '';
+      return;
+    }
+    // Stream is still running — resume display of accumulated content
+    setStatus('summarizing');
+    setStreamPaused(false);
+    setPausedContent('');
+    pausedContentRef.current = '';
+  }, [article, cacheKey]);
 
   const handleStyleChange = useCallback((s: SummaryStyle) => {
     setActiveStyle(s); setCacheHit(false); setStreamContent(''); setStreamPaused(false); setWordCount(DEFAULT_WC[s]);
@@ -462,7 +485,9 @@ export default function App() {
             } disabled:opacity-40 disabled:cursor-not-allowed`}>
             {testing ? <><Spinner />{t('testing_')}</>
               : testResult
-                ? testResult.ok ? t('testOk') : `${t('testFail')}: ${testResult.message.slice(0, 60)}`
+                ? testResult.ok
+                  ? t('testOk')
+                  : `${t('testFail')}: ${testResult.message === 'NO_API_KEY' ? t('testNoKey') : testResult.message.slice(0, 60)}`
                 : t('testApi')}
           </button>
 
@@ -542,7 +567,7 @@ function ArchiveInput() {
   const inputRef = useRef<HTMLInputElement>(null);
   const openInArchive = useCallback(() => {
     const url = inputRef.current?.value?.trim();
-    if (url) { chrome.runtime.sendMessage({ type: 'REDIRECT_TO_ARCHIVE', url }); inputRef.current.value = ''; }
+    if (url) { chrome.runtime.sendMessage({ type: 'REDIRECT_TO_ARCHIVE', url }); if (inputRef.current) inputRef.current.value = ''; }
   }, []);
   return (
     <div className="flex items-center gap-1.5">

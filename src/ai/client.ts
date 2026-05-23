@@ -14,25 +14,37 @@ interface ProviderPreset { label: string; url: string; model: string }
 export const PROVIDERS: Record<string, ProviderPreset> = {
   deepseek:  { label: 'DeepSeek',  url: 'https://api.deepseek.com/v1',     model: 'deepseek-reasoner' },
   openai:    { label: 'OpenAI',    url: 'https://api.openai.com/v1',       model: 'gpt-4o-mini' },
-  anthropic: { label: 'Anthropic', url: 'https://api.anthropic.com/v1',    model: 'claude-sonnet-4-20250514' },
-  ollama:    { label: 'Ollama',    url: 'http://localhost:11434/v1',       model: 'llama3' },
+  anthropic: { label: 'Anthropic', url: 'https://api.anthropic.com',       model: 'claude-sonnet-4-20250514' },
+  ollama:    { label: 'Ollama',    url: 'http://localhost:11434/v1',       model: 'llama3.2' },
 };
+
+export function isAnthropicUrl(baseUrl: string): boolean {
+  // Match exactly 'anthropic.com' or 'anthropic.net' as a domain (not a substring)
+  return /(?:^|\.)anthropic\.(com|net)(?:[/:#?]|$)/.test(baseUrl);
+}
 
 export async function testConnection(): Promise<{ ok: boolean; message: string }> {
   const config = await readConfig();
-  if (!config.apiKey) return { ok: false, message: '请先填写 API 密钥' };
+  if (!config.apiKey) return { ok: false, message: 'NO_API_KEY' };
 
   try {
-    const res = await fetch(`${config.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` },
-      body: JSON.stringify({
-        model: config.model,
-        messages: [{ role: 'user', content: 'Hi' }],
-        max_tokens: 5,
-      }),
-    });
-    if (res.ok) return { ok: true, message: '连接成功' };
+    const anthropic = isAnthropicUrl(config.baseUrl);
+    const body = anthropic
+      ? JSON.stringify({ model: config.model, max_tokens: 5, messages: [{ role: 'user', content: 'Hi' }] })
+      : JSON.stringify({ model: config.model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 });
+
+    const endpoint = anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+    if (anthropic) {
+      headers['x-api-key'] = config.apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+    } else {
+      headers['Authorization'] = `Bearer ${config.apiKey}`;
+    }
+
+    const res = await fetch(endpoint, { method: 'POST', headers, body });
+    if (res.ok) return { ok: true, message: 'SUCCESS' };
     let errBody = '';
     try { errBody = await res.text(); } catch { /* */ }
     return { ok: false, message: errBody ? errBody.slice(0, 300) : `HTTP ${res.status}` };
@@ -58,7 +70,11 @@ interface PromptConfig {
   summaryDepth: string;
 }
 
-const PROMPT_CFG: Record<SummaryStyle, PromptConfig> = {
+export const PROMPT_CFG: Record<SummaryStyle, PromptConfig> = {
+  custom: {
+    vocabLevel: 'appropriate vocabulary for the topic',
+    summaryDepth: 'Follow the custom instructions below for structure and depth.',
+  },
   concise: {
     vocabLevel: 'simple vocabulary (approximately 3000-word level, suitable for middle-school readers)',
     summaryDepth: 'Cover the main argument and conclusion concisely in flowing paragraph form (not bullet points).',
@@ -73,7 +89,7 @@ const PROMPT_CFG: Record<SummaryStyle, PromptConfig> = {
   },
 };
 
-function buildPrompt(
+export function buildPrompt(
   article: ArticleData,
   style: SummaryStyle,
   wordCount: number,
@@ -83,24 +99,8 @@ function buildPrompt(
   let system: string;
 
   if (style === 'custom' && customPrompt) {
-    // Build the default prompt for the selected style as a base
-    const cfg = PROMPT_CFG[style];
-    system = `You are a reading assistant. Summarize the article in English using ${cfg.vocabLevel}.
-
-Output exactly two sections in Markdown:
-
-## Summary
-A flowing prose summary of the entire article.
-${cfg.summaryDepth}
-
-## Glossary
-- **Term**: Brief definition — only terms essential to understanding the article
-
-Rules: output only the Markdown, no preamble.`;
-
-    // Append custom prompt on top (higher priority)
-    let custom = customPrompt.replace(/\{wordCount\}/g, String(wordCount));
-    system += `\n\n## Custom Instructions (override defaults where they conflict)\n${custom}`;
+    // Custom mode: use the user's prompt as the system prompt (no base prompt)
+    system = customPrompt.replace(/\{wordCount\}/g, String(wordCount));
 
     // Append word limit if not unlimited
     if (wordCount > 0) {
@@ -137,7 +137,7 @@ Rules: output only the Markdown, no preamble.${wordCount > 0 ? ' The word limit 
   return { system, user };
 }
 
-function buildBody(config: AIConfig, system: string, user: string, maxTokens: number, stream: boolean) {
+export function buildBody(config: AIConfig, system: string, user: string, maxTokens: number, stream: boolean) {
   return {
     model: config.model,
     messages: [
@@ -152,51 +152,60 @@ function buildBody(config: AIConfig, system: string, user: string, maxTokens: nu
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-const MAX_INPUT_LENGTH = 24000;
+export const MAX_INPUT_LENGTH = 24000;
 
-function computeMaxTokens(wordCount: number): number {
+export function computeMaxTokens(wordCount: number): number {
   // 1 word ≈ 1.5 tokens; add headroom for glossary + formatting
   return Math.ceil(wordCount * 2) + 600;
 }
 
-// ── Non-streaming ──────────────────────────────────────────────────────
+// ── Anthropic SSE stream parser ────────────────────────────────────────
 
-export async function generateSummary(
-  article: ArticleData,
-  style: SummaryStyle = 'concise',
-  wordCount = 200,
-  bilingual = false,
-  customPrompt?: string,
-): Promise<string> {
-  const config = await readConfig();
+export async function* anthropicParseStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  decoder: TextDecoder,
+): AsyncGenerator<string, string, undefined> {
+  let buffer = '';
+  let fullContent = '';
+  let currentEvent = '';
 
-  if (!config.apiKey) throw new Error('API key not configured.');
-  if (!article.textContent?.trim()) throw new Error('Article has no text content.');
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-  const { system, user } = buildPrompt(article, style, wordCount, bilingual, customPrompt);
-  const maxTokens = computeMaxTokens(wordCount);
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
 
-  const truncatedUser =
-    user.length > MAX_INPUT_LENGTH
-      ? user.slice(0, MAX_INPUT_LENGTH) + '\n\n[Article truncated]'
-      : user;
-
-  const res = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` },
-    body: JSON.stringify(buildBody(config, system, truncatedUser, maxTokens, false)),
-  });
-
-  if (!res.ok) {
-    let e = '';
-    try { e = await res.text(); } catch { /* */ }
-    throw new Error(`API error ${res.status}: ${e || res.statusText}`);
+    for (const line of lines) {
+      const t = line.trim();
+      if (t.startsWith('event: ')) {
+        currentEvent = t.slice(7).trim();
+      } else if (t.startsWith('data: ')) {
+        const d = t.slice(6);
+        if (d === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(d);
+          // Handle error events from Anthropic
+          if (parsed.type === 'error') {
+            throw new Error(parsed.error?.message || 'Anthropic API error');
+          }
+          // Extract text from content_block_delta events
+          if (currentEvent === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+            const text = parsed.delta.text || '';
+            if (text) {
+              fullContent += text;
+              yield text;
+            }
+          }
+        } catch (e) {
+          if (e instanceof SyntaxError) continue;
+          throw e;
+        }
+      } // else: blank line = event separator, ignore
+    }
   }
-
-  const data = await res.json();
-  const content: string | undefined = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error('API response missing content');
-  return content;
+  return fullContent;
 }
 
 // ── Streaming ──────────────────────────────────────────────────────────
@@ -211,8 +220,8 @@ export async function* generateSummaryStream(
 ): AsyncGenerator<string, string, undefined> {
   const config = await readConfig();
 
-  if (!config.apiKey) throw new Error('API key not configured.');
-  if (!article.textContent?.trim()) throw new Error('Article has no text content.');
+  if (!config.apiKey) throw new Error('API 密钥未配置 / API key not configured.');
+  if (!article.textContent?.trim()) throw new Error('文章无文本内容 / Article has no text content.');
 
   const { system, user } = buildPrompt(article, style, wordCount, bilingual, customPrompt);
   const maxTokens = computeMaxTokens(wordCount);
@@ -222,9 +231,41 @@ export async function* generateSummaryStream(
       ? user.slice(0, MAX_INPUT_LENGTH) + '\n\n[Article truncated]'
       : user;
 
+  const anthropic = isAnthropicUrl(config.baseUrl);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  if (anthropic) {
+    headers['x-api-key'] = config.apiKey;
+    headers['anthropic-version'] = '2023-06-01';
+
+    const body = JSON.stringify({
+      model: config.model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: truncatedUser }],
+      temperature: config.temperature,
+      stream: true,
+    });
+
+    const res = await fetch(`${config.baseUrl}/v1/messages`, {
+      method: 'POST', headers, body, signal,
+    });
+
+    if (!res.ok) {
+      let e = '';
+      try { e = await res.text(); } catch { /* */ }
+      throw new Error(`API 错误 ${res.status} / API error ${res.status}: ${e || res.statusText}`);
+    }
+
+    return yield* anthropicParseStream(res.body!.getReader(), new TextDecoder());
+  }
+
+  // OpenAI-compatible providers
+  headers['Authorization'] = `Bearer ${config.apiKey}`;
+
   const res = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` },
+    headers,
     body: JSON.stringify(buildBody(config, system, truncatedUser, maxTokens, true)),
     signal,
   });
@@ -232,7 +273,7 @@ export async function* generateSummaryStream(
   if (!res.ok) {
     let e = '';
     try { e = await res.text(); } catch { /* */ }
-    throw new Error(`API error ${res.status}: ${e || res.statusText}`);
+    throw new Error(`API 错误 ${res.status} / API error ${res.status}: ${e || res.statusText}`);
   }
 
   const reader = res.body!.getReader();

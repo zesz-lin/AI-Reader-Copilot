@@ -18,9 +18,9 @@ function parseArticle(doc: Document, opts: ExtractOptions = {}): ArticleData | n
   if (!article) return null;
 
   return {
-    title: article.title,
-    textContent: article.textContent,
-    content: article.content,
+    title: article.title || '',
+    textContent: article.textContent || '',
+    content: article.content || '',
     excerpt: article.excerpt ?? undefined,
     byline: article.byline ?? undefined,
   };

@@ -1,4 +1,6 @@
 node_modules/
 dist/
+chrome-test-profile/
 *.log
 .DS_Store
+coverage/

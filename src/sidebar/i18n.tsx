@@ -59,9 +59,12 @@ const DICT: Record<string, { zh: string; en: string }> = {
   continue_:           { zh: '继续',               en: 'Continue' },
   testOk:              { zh: '✓ 连接成功',         en: '✓ Connected' },
   testFail:            { zh: '✗ 连接失败',         en: '✗ Connection failed' },
-  custom_:             { zh: '自定义',             en: 'Custom' },
+  testNoKey:           { zh: '请先填写 API 密钥',   en: 'Please enter an API key' },
+
   customPromptHint:    { zh: '输入自定义提示词…',   en: 'Enter custom prompt…' },
   unlimited:           { zh: '不限',               en: 'Unlimited' },
+  archiveFetching:     { zh: '正在从 archive.ph 获取...', en: 'Fetching from archive.ph...' },
+  archiveFail:         { zh: 'archive.ph 无法获取该页面内容', en: 'archive.ph failed to retrieve content' },
   provider:            { zh: '提供商',             en: 'Provider' },
   testApi:             { zh: '测试API连接',       en: 'Test API Connection' },
   saveAll:             { zh: '保存所有设置',       en: 'Save All Settings' },

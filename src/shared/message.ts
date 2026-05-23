@@ -2,12 +2,6 @@ import type { ArticleData, ArticleRecord, SummaryStyle, HistoryEntry } from './t
 
 // ── Content script → Background ────────────────────────────────────────
 
-export interface PageInfoMessage {
-  type: 'PAGE_INFO';
-  payload: { url: string; title: string };
-  timestamp: number;
-}
-
 export interface ArticleExtractedMessage {
   type: 'ARTICLE_EXTRACTED';
   payload: ArticleData & { url: string };
@@ -94,7 +88,7 @@ export type ContentScriptMessage = ExtractArticleMessage;
 // ── Unions ─────────────────────────────────────────────────────────────
 
 export type AppMessage =
-  | PageInfoMessage | ArticleExtractedMessage | NoArticleFoundMessage
+  | ArticleExtractedMessage | NoArticleFoundMessage
   | GenerateSummaryMessage | GetLastArticleMessage | ExtractArticleMessage
   | SaveToHistoryMessage | GetHistoryMessage | ClearHistoryMessage
   | DeleteHistoryEntryMessage | RedirectToArchiveMessage | StopStreamingMessage;
