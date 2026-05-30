@@ -26,6 +26,24 @@ export function downloadMarkdown(
   URL.revokeObjectURL(url);
 }
 
+export function downloadMarkdownBatch(content: string, filename: string): void {
+  const slug = filename
+    .replace(/[^\w\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 60)
+    .toLowerCase();
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${slug}.md`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
 export async function copyFullMarkdown(content: string): Promise<void> {
   await navigator.clipboard.writeText(content);
 }

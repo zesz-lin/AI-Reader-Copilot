@@ -1,5 +1,20 @@
 import type { ArticleData, AIConfig, SummaryStyle } from '../shared';
 
+// ── Lightweight i18n for service worker context ────────────────────────
+
+let _lang: 'zh' | 'en' = 'zh';
+
+chrome.storage.local.get('language').then((r) => {
+  if (r.language === 'zh' || r.language === 'en') _lang = r.language;
+});
+chrome.storage.onChanged.addListener((changes) => {
+  if (changes.language?.newValue) _lang = changes.language.newValue;
+});
+
+function t(zh: string, en: string): string {
+  return _lang === 'en' ? en : zh;
+}
+
 const DEFAULT_CONFIG: AIConfig = {
   apiKey: '',
   baseUrl: 'https://api.deepseek.com/v1',
@@ -19,8 +34,44 @@ export const PROVIDERS: Record<string, ProviderPreset> = {
 };
 
 export function isAnthropicUrl(baseUrl: string): boolean {
-  // Match exactly 'anthropic.com' or 'anthropic.net' as a domain (not a substring)
   return /(?:^|\.)anthropic\.(com|net)(?:[/:#?]|$)/.test(baseUrl);
+}
+
+// ── Anthropic API helper ──────────────────────────────────────────────
+
+interface AnthropicRequest {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  system?: string;
+  messages: { role: string; content: string }[];
+  maxTokens: number;
+  temperature?: number;
+  stream?: boolean;
+}
+
+export function buildAnthropicHeaders(apiKey: string): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01',
+  };
+}
+
+export function buildAnthropicEndpoint(baseUrl: string): string {
+  return `${baseUrl}/v1/messages`;
+}
+
+export function buildAnthropicBody(req: AnthropicRequest): string {
+  const body: Record<string, unknown> = {
+    model: req.model,
+    max_tokens: req.maxTokens,
+    messages: req.messages,
+  };
+  if (req.system) body.system = req.system;
+  if (req.temperature !== undefined) body.temperature = req.temperature;
+  if (req.stream !== undefined) body.stream = req.stream;
+  return JSON.stringify(body);
 }
 
 export async function testConnection(): Promise<{ ok: boolean; message: string }> {
@@ -29,24 +80,29 @@ export async function testConnection(): Promise<{ ok: boolean; message: string }
 
   try {
     const anthropic = isAnthropicUrl(config.baseUrl);
+
     const body = anthropic
-      ? JSON.stringify({ model: config.model, max_tokens: 5, messages: [{ role: 'user', content: 'Hi' }] })
+      ? buildAnthropicBody({
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
+          model: config.model,
+          messages: [{ role: 'user', content: 'Hi' }],
+          maxTokens: 5,
+        })
       : JSON.stringify({ model: config.model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5 });
 
-    const endpoint = anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const endpoint = anthropic
+      ? buildAnthropicEndpoint(config.baseUrl)
+      : `${config.baseUrl}/chat/completions`;
 
-    if (anthropic) {
-      headers['x-api-key'] = config.apiKey;
-      headers['anthropic-version'] = '2023-06-01';
-    } else {
-      headers['Authorization'] = `Bearer ${config.apiKey}`;
-    }
+    const headers = anthropic
+      ? buildAnthropicHeaders(config.apiKey)
+      : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.apiKey}` };
 
     const res = await fetch(endpoint, { method: 'POST', headers, body });
     if (res.ok) return { ok: true, message: 'SUCCESS' };
     let errBody = '';
-    try { errBody = await res.text(); } catch { /* */ }
+    try { errBody = await res.text(); } catch (e) { console.warn('[ai-reader-copilot] Failed to read error body:', e); }
     return { ok: false, message: errBody ? errBody.slice(0, 300) : `HTTP ${res.status}` };
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : String(e) };
@@ -99,10 +155,8 @@ export function buildPrompt(
   let system: string;
 
   if (style === 'custom' && customPrompt) {
-    // Custom mode: use the user's prompt as the system prompt (no base prompt)
     system = customPrompt.replace(/\{wordCount\}/g, String(wordCount));
 
-    // Append word limit if not unlimited
     if (wordCount > 0) {
       system += `\n\n**Strictly limit the output to ${wordCount}–${Math.ceil(wordCount * 1.2)} words.**`;
     }
@@ -154,8 +208,14 @@ export function buildBody(config: AIConfig, system: string, user: string, maxTok
 
 export const MAX_INPUT_LENGTH = 24000;
 
+function truncateAtWordBoundary(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const truncated = text.slice(0, maxLength);
+  const lastSpace = truncated.lastIndexOf(' ');
+  return (lastSpace > maxLength * 0.8 ? truncated.slice(0, lastSpace) : truncated) + '\n\n' + t('[文章已截断]', '[Article truncated]');
+}
+
 export function computeMaxTokens(wordCount: number): number {
-  // 1 word ≈ 1.5 tokens; add headroom for glossary + formatting
   return Math.ceil(wordCount * 2) + 600;
 }
 
@@ -178,19 +238,17 @@ export async function* anthropicParseStream(
     buffer = lines.pop() || '';
 
     for (const line of lines) {
-      const t = line.trim();
-      if (t.startsWith('event: ')) {
-        currentEvent = t.slice(7).trim();
-      } else if (t.startsWith('data: ')) {
-        const d = t.slice(6);
+      const trimmed = line.trim();
+      if (trimmed.startsWith('event: ')) {
+        currentEvent = trimmed.slice(7).trim();
+      } else if (trimmed.startsWith('data: ')) {
+        const d = trimmed.slice(6);
         if (d === '[DONE]') continue;
         try {
           const parsed = JSON.parse(d);
-          // Handle error events from Anthropic
           if (parsed.type === 'error') {
-            throw new Error(parsed.error?.message || 'Anthropic API error');
+            throw new Error(parsed.error?.message || t('Anthropic API 错误', 'Anthropic API error'));
           }
-          // Extract text from content_block_delta events
           if (currentEvent === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
             const text = parsed.delta.text || '';
             if (text) {
@@ -199,10 +257,13 @@ export async function* anthropicParseStream(
             }
           }
         } catch (e) {
-          if (e instanceof SyntaxError) continue;
+          if (e instanceof SyntaxError) {
+            console.warn('[ai-reader-copilot] Anthropic SSE JSON parse error, skipping line');
+            continue;
+          }
           throw e;
         }
-      } // else: blank line = event separator, ignore
+      }
     }
   }
   return fullContent;
@@ -220,48 +281,47 @@ export async function* generateSummaryStream(
 ): AsyncGenerator<string, string, undefined> {
   const config = await readConfig();
 
-  if (!config.apiKey) throw new Error('API 密钥未配置 / API key not configured.');
-  if (!article.textContent?.trim()) throw new Error('文章无文本内容 / Article has no text content.');
+  if (!config.apiKey) throw new Error(t('API 密钥未配置', 'API key not configured.'));
+  if (!article.textContent?.trim()) throw new Error(t('文章无文本内容', 'Article has no text content.'));
 
   const { system, user } = buildPrompt(article, style, wordCount, bilingual, customPrompt);
   const maxTokens = computeMaxTokens(wordCount);
 
-  const truncatedUser =
-    user.length > MAX_INPUT_LENGTH
-      ? user.slice(0, MAX_INPUT_LENGTH) + '\n\n[Article truncated]'
-      : user;
+  const truncatedUser = truncateAtWordBoundary(user, MAX_INPUT_LENGTH);
 
   const anthropic = isAnthropicUrl(config.baseUrl);
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 
   if (anthropic) {
-    headers['x-api-key'] = config.apiKey;
-    headers['anthropic-version'] = '2023-06-01';
-
-    const body = JSON.stringify({
+    const headers = buildAnthropicHeaders(config.apiKey);
+    const body = buildAnthropicBody({
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
       model: config.model,
-      max_tokens: maxTokens,
       system,
       messages: [{ role: 'user', content: truncatedUser }],
+      maxTokens,
       temperature: config.temperature,
       stream: true,
     });
 
-    const res = await fetch(`${config.baseUrl}/v1/messages`, {
+    const res = await fetch(buildAnthropicEndpoint(config.baseUrl), {
       method: 'POST', headers, body, signal,
     });
 
     if (!res.ok) {
       let e = '';
-      try { e = await res.text(); } catch { /* */ }
-      throw new Error(`API 错误 ${res.status} / API error ${res.status}: ${e || res.statusText}`);
+      try { e = await res.text(); } catch (err) { console.warn('[ai-reader-copilot] Failed to read Anthropic error body:', err); }
+      throw new Error(`${t('API 错误', 'API error')} ${res.status}: ${e || res.statusText}`);
     }
 
     return yield* anthropicParseStream(res.body!.getReader(), new TextDecoder());
   }
 
   // OpenAI-compatible providers
-  headers['Authorization'] = `Bearer ${config.apiKey}`;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${config.apiKey}`,
+  };
 
   const res = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -272,8 +332,8 @@ export async function* generateSummaryStream(
 
   if (!res.ok) {
     let e = '';
-    try { e = await res.text(); } catch { /* */ }
-    throw new Error(`API 错误 ${res.status} / API error ${res.status}: ${e || res.statusText}`);
+    try { e = await res.text(); } catch (err) { console.warn('[ai-reader-copilot] Failed to read OpenAI error body:', err); }
+    throw new Error(`${t('API 错误', 'API error')} ${res.status}: ${e || res.statusText}`);
   }
 
   const reader = res.body!.getReader();
@@ -290,15 +350,17 @@ export async function* generateSummaryStream(
     buffer = lines.pop() || '';
 
     for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith('data: ')) continue;
-      const d = t.slice(6);
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      const d = trimmed.slice(6);
       if (d === '[DONE]') continue;
       try {
         const p = JSON.parse(d);
         const c: string | undefined = p.choices?.[0]?.delta?.content;
         if (c) { fullContent += c; yield c; }
-      } catch { /* */ }
+      } catch {
+        console.warn('[ai-reader-copilot] OpenAI SSE JSON parse error, skipping line');
+      }
     }
   }
   return fullContent;

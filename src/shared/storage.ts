@@ -4,7 +4,7 @@ const HISTORY_KEY = 'history';
 const MAX_ENTRIES = 20;
 
 function uid(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return crypto.randomUUID();
 }
 
 export async function saveToHistory(entry: {

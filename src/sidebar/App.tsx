@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ArticleRecord, ArticleRecordResponse, SummaryResponse,
   SummaryStyle, HistoryEntry, HistoryListResponse, SidePanelMessage,
@@ -7,7 +7,7 @@ import { useI18n } from './i18n';
 import { useTheme } from './useTheme';
 import { PROVIDERS, testConnection } from '../ai';
 import MarkdownView from './MarkdownView';
-import { downloadMarkdown, copyFullMarkdown } from './export';
+import { downloadMarkdown, copyFullMarkdown, downloadMarkdownBatch } from './export';
 
 type Status = 'idle' | 'extracting' | 'article-ready' | 'summarizing' | 'done' | 'error';
 type Tab = 'article' | 'history' | 'settings';
@@ -43,6 +43,9 @@ export default function App() {
   const [pausedContent, setPausedContent] = useState('');
   const [wordCount, setWordCount] = useState(200);
   const [customPrompt, setCustomPrompt] = useState('');
+  const [exportContent, setExportContent] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const pausedContentRef = useRef('');
   const streamPausedRef = useRef(streamPaused);
@@ -68,9 +71,28 @@ export default function App() {
         : article?.summaries?.[cacheKey] ?? article?.summaryMarkdown ?? null;
   const isStyleCached = article?.summaries?.[cacheKey] != null;
 
+  const filteredHistory = useMemo(() => {
+    if (!searchQuery.trim()) return history;
+    const query = searchQuery.toLowerCase();
+    return history.filter(
+      (entry) =>
+        entry.title.toLowerCase().includes(query) ||
+        entry.url.toLowerCase().includes(query) ||
+        entry.summaryMarkdown.toLowerCase().includes(query),
+    );
+  }, [history, searchQuery]);
+
+  const refreshHistory = useCallback(async () => {
+    const res = await chrome.runtime.sendMessage<{ type: string }, HistoryListResponse>({ type: 'GET_HISTORY' });
+    if (res?.status === 'ok') setHistory(res.entries);
+  }, []);
+
   // ── Bootstrap ──────────────────────────────────────────────────────
 
   useEffect(() => {
+    // Connect to background for stream abort on side panel close
+    const port = chrome.runtime.connect({ name: 'side-panel' });
+
     chrome.runtime.sendMessage<{ type: string }, ArticleRecordResponse>({ type: 'GET_LAST_ARTICLE' })
       .then((res) => {
         if (res?.status === 'ok' && res.article) {
@@ -92,6 +114,8 @@ export default function App() {
       if (typeof r.temperature === 'number') setTemperature(r.temperature);
       if (typeof r.autoTranslateTitle === 'boolean') setAutoTranslateTitle(r.autoTranslateTitle);
     });
+
+    return () => { port.disconnect(); };
   }, []);
 
   useEffect(() => {
@@ -107,6 +131,7 @@ export default function App() {
                 summaryMarkdown: message.summaryMarkdown!,
                 summaries: { ...prev.summaries, [cacheKey]: message.summaryMarkdown! },
               } : null);
+              setExportContent(message.summaryMarkdown!);
             } else {
               setStatus('error'); setError(t('aiEmpty'));
             }
@@ -115,7 +140,6 @@ export default function App() {
 
           // Normal done handling
           if (message.summaryMarkdown) {
-            const style = (message.style as SummaryStyle) || 'concise';
             // Merge with paused content if this was a continued stream
             const prefix = pausedContentRef.current;
             const fullSummary = prefix ? prefix + message.summaryMarkdown : message.summaryMarkdown!;
@@ -126,6 +150,7 @@ export default function App() {
             } : null);
             setPausedContent('');
             pausedContentRef.current = '';
+            setExportContent(null);
             setStatus('done'); refreshHistory();
           } else { setStatus('error'); setError(t('aiEmpty')); }
         } else { setStreamContent((prev) => prev + message.content); }
@@ -142,7 +167,7 @@ export default function App() {
     }
     chrome.runtime.onMessage.addListener(listener);
     return () => chrome.runtime.onMessage.removeListener(listener);
-  }, [cacheKey]);
+  }, [cacheKey, t, refreshHistory]);
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -155,7 +180,7 @@ export default function App() {
   // ── Handlers ───────────────────────────────────────────────────────
 
   const handleExtract = useCallback(async () => {
-    setStatus('extracting'); setError(null); setStreamContent(''); setShowRawText(false); setStreamPaused(false); setPausedContent('');
+    setStatus('extracting'); setError(null); setStreamContent(''); setShowRawText(false); setStreamPaused(false); setPausedContent(''); setExportContent(null);
     try {
       const res = await chrome.runtime.sendMessage<{ type: string }, ArticleRecordResponse>({ type: 'EXTRACT_ARTICLE' });
       if (res?.status === 'ok' && res.article) {
@@ -167,7 +192,7 @@ export default function App() {
   }, [t]);
 
   const handleSummarize = useCallback(async (force = false) => {
-    setStatus('summarizing'); setError(null); setCacheHit(false); setStreamContent(''); setStreamPaused(false); setPausedContent('');
+    setStatus('summarizing'); setError(null); setCacheHit(false); setStreamContent(''); setStreamPaused(false); setPausedContent(''); setExportContent(null);
     try {
       const res = await chrome.runtime.sendMessage<
         { type: string; style: SummaryStyle; wordCount: number; customPrompt?: string; force?: boolean; bilingual?: boolean }, SummaryResponse
@@ -179,7 +204,7 @@ export default function App() {
         setStatus('summarizing');
       } else { setError(res?.error || t('summaryFail')); setStatus('error'); }
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); setStatus('error'); }
-  }, [activeStyle, wordCount, bilingual, cacheKey, t]);
+  }, [activeStyle, wordCount, bilingual, cacheKey, t, customPrompt]);
 
   const handlePauseStream = useCallback(() => {
     setPausedContent(streamContent);
@@ -195,6 +220,7 @@ export default function App() {
       setStreamPaused(false);
       setPausedContent('');
       pausedContentRef.current = '';
+      setExportContent(null);
       return;
     }
     // Stream is still running — resume display of accumulated content
@@ -205,32 +231,36 @@ export default function App() {
   }, [article, cacheKey]);
 
   const handleStyleChange = useCallback((s: SummaryStyle) => {
-    setActiveStyle(s); setCacheHit(false); setStreamContent(''); setStreamPaused(false); setWordCount(DEFAULT_WC[s]);
+    setActiveStyle(s); setCacheHit(false); setStreamContent(''); setStreamPaused(false); setWordCount(DEFAULT_WC[s]); setExportContent(null);
   }, []);
 
   const handleCopy = useCallback(async () => {
-    if (!displayedMarkdown) return;
-    await copyFullMarkdown(displayedMarkdown);
+    const content = exportContent ?? displayedMarkdown;
+    if (!content) return;
+    await copyFullMarkdown(content);
     setCopied(true); setTimeout(() => setCopied(false), 2000); setMenuOpen(false);
-  }, [displayedMarkdown]);
+  }, [exportContent, displayedMarkdown]);
 
   const handleDownload = useCallback(() => {
-    if (!displayedMarkdown || !article?.title) return;
-    downloadMarkdown(displayedMarkdown, article.title, activeStyle); setMenuOpen(false);
-  }, [displayedMarkdown, article, activeStyle]);
+    const content = exportContent ?? displayedMarkdown;
+    if (!content || !article?.title) return;
+    downloadMarkdown(content, article.title, activeStyle); setMenuOpen(false);
+  }, [exportContent, displayedMarkdown, article, activeStyle]);
 
   const handleSaveToHistory = useCallback(async () => {
-    if (!displayedMarkdown || !article) return; setMenuOpen(false);
+    const content = exportContent ?? displayedMarkdown;
+    if (!content || !article) return; setMenuOpen(false);
     const res = await chrome.runtime.sendMessage<{ type: string; payload: object }, HistoryListResponse>({
-      type: 'SAVE_TO_HISTORY', payload: { url: article.url, title: article.title, summaryMarkdown: displayedMarkdown, style: activeStyle, rawText: article.rawText },
+      type: 'SAVE_TO_HISTORY', payload: { url: article.url, title: article.title, summaryMarkdown: content, style: activeStyle, rawText: article.rawText },
     });
     if (res?.status === 'ok') setHistory(res.entries);
-  }, [displayedMarkdown, article, activeStyle]);
+  }, [exportContent, displayedMarkdown, article, activeStyle]);
 
   const handleClearHistory = useCallback(async () => {
+    if (!window.confirm(t('confirmClearAll'))) return;
     const res = await chrome.runtime.sendMessage<{ type: string }, HistoryListResponse>({ type: 'CLEAR_HISTORY' });
     if (res?.status === 'ok') setHistory([]);
-  }, []);
+  }, [t]);
 
   const handleDeleteHistoryEntry = useCallback(async (id: string) => {
     const res = await chrome.runtime.sendMessage<{ type: string; id: string }, HistoryListResponse>({ type: 'DELETE_HISTORY_ENTRY', id });
@@ -241,6 +271,61 @@ export default function App() {
     setArticle({ url: entry.url, title: entry.title, summaryMarkdown: entry.summaryMarkdown, summaries: { [entry.style]: entry.summaryMarkdown }, rawText: entry.rawText });
     setActiveStyle(entry.style); setStatus('done'); setStreamContent(''); setActiveTab('article');
   }, []);
+
+  const handleSearchChange = useCallback((query: string) => {
+    setSearchQuery(query);
+    setSelectedIds(new Set());
+  }, []);
+
+  const handleToggleSelect = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSelectAll = useCallback(() => {
+    if (selectedIds.size === filteredHistory.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredHistory.map((e) => e.id)));
+    }
+  }, [filteredHistory, selectedIds.size]);
+
+  const handleBatchDelete = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+    const count = selectedIds.size;
+    if (!window.confirm(t('confirmDelete').replace('{count}', String(count)))) return;
+
+    for (const id of selectedIds) {
+      await chrome.runtime.sendMessage<{ type: string; id: string }, HistoryListResponse>({
+        type: 'DELETE_HISTORY_ENTRY',
+        id,
+      });
+    }
+    setSelectedIds(new Set());
+    refreshHistory();
+  }, [selectedIds, t, refreshHistory]);
+
+  const handleBatchExport = useCallback(async () => {
+    const entriesToExport = selectedIds.size > 0
+      ? history.filter((e) => selectedIds.has(e.id))
+      : history;
+
+    if (entriesToExport.length === 0) return;
+
+    const content = entriesToExport
+      .map((entry) => `# ${entry.title}\n\n**${t('exportUrl')}:** ${entry.url}\n**${t('exportStyle')}:** ${entry.style}\n**${t('exportDate')}:** ${new Date(entry.timestamp).toLocaleString()}\n\n---\n\n${entry.summaryMarkdown}`)
+      .join('\n\n---\n\n');
+
+    downloadMarkdownBatch(content, 'history-export');
+    setSelectedIds(new Set());
+  }, [history, selectedIds, t]);
 
   const handleProviderChange = useCallback((key: string) => {
     setProvider(key); setTestResult(null);
@@ -259,11 +344,6 @@ export default function App() {
     setSettingsSaved(true); setTimeout(() => setSettingsSaved(false), 2000);
   }, [apiKey, baseUrl, model, temperature, autoTranslateTitle]);
 
-  const refreshHistory = useCallback(async () => {
-    const res = await chrome.runtime.sendMessage<{ type: string }, HistoryListResponse>({ type: 'GET_HISTORY' });
-    if (res?.status === 'ok') setHistory(res.entries);
-  }, []);
-
   const canExtract = status !== 'extracting' && status !== 'summarizing';
   const canSummarize = article !== null && status !== 'summarizing' && status !== 'extracting';
   const canExport = displayedMarkdown != null && status === 'done';
@@ -281,7 +361,7 @@ export default function App() {
       {activeTab === 'article' && (<>
         <div className="flex-1 overflow-y-auto">
           <div className="px-4 py-2 border-b border-neutral-100 dark:border-neutral-800 space-y-2 transition-colors duration-200">
-            <button onClick={handleExtract} disabled={!canExtract} className={btn}>
+            <button onClick={handleExtract} disabled={!canExtract} className={btn} aria-label={t('extract')}>
               {status === 'extracting' ? <><Spinner />{t('extracting')}</> : t('extract')}
             </button>
             <p className="text-xs text-neutral-400 dark:text-neutral-600 text-center">{t('paywallHint')}</p>
@@ -307,7 +387,7 @@ export default function App() {
                       activeStyle === s ? 'bg-neutral-300 dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-sm' : 'text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-300'
                     } disabled:opacity-40`}>
                     {styleLabel(s)}
-                    {article.summaries?.[s] && !isSummarizing && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-green-500 align-middle" />}
+                    {article.summaries?.[s] && !isSummarizing && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-green-500 align-middle" aria-label={t('cached')} />}
                   </button>
                 ))}
               </div>
@@ -330,18 +410,18 @@ export default function App() {
           )}
 
           <div className="flex items-center gap-2 px-4 py-3 border-b border-neutral-100 dark:border-neutral-800 transition-colors duration-200">
-            <button onClick={() => setShowRawText((v) => !v)} disabled={!article} className={`${btn} ${showRawText ? 'bg-neutral-300 dark:bg-neutral-700' : ''}`}>
+            <button onClick={() => setShowRawText((v) => !v)} disabled={!article} className={`${btn} ${showRawText ? 'bg-neutral-300 dark:bg-neutral-700' : ''}`} aria-label={t(showRawText ? 'hideRaw' : 'showRaw')}>
               {t(showRawText ? 'hideRaw' : 'showRaw')}
             </button>
-            <button onClick={() => handleSummarize(isStyleCached)} disabled={!canSummarize} className={btn}>
+            <button onClick={() => handleSummarize(isStyleCached)} disabled={!canSummarize} className={btn} aria-label={isSummarizing ? t('summarizing') : t('summarize')}>
               {isSummarizing ? <><Spinner />{t('summarizing')}</> : isStyleCached ? t('regenerating') : t('summarize')}
             </button>
             <button onClick={() => setBilingual((v) => !v)} disabled={!canSummarize}
-              className={`${btn} ${bilingual ? 'bg-blue-100 dark:bg-blue-900/30 border-blue-400 dark:border-blue-600 text-blue-700 dark:text-blue-300' : ''}`}>
+              className={`${btn} ${bilingual ? 'bg-blue-100 dark:bg-blue-900/30 border-blue-400 dark:border-blue-600 text-blue-700 dark:text-blue-300' : ''}`} aria-label={t(bilingual ? 'bilingualOn' : 'bilingualOff')}>
               {t(bilingual ? 'bilingualOn' : 'bilingualOff')}
             </button>
             <div className="ml-auto relative" ref={menuRef}>
-              <button onClick={() => setMenuOpen((v) => !v)} disabled={!canExport} className={btn}>
+              <button onClick={() => setMenuOpen((v) => !v)} disabled={!canExport} className={btn} aria-label={t('export')} aria-haspopup="menu" aria-expanded={menuOpen}>
                 {t('export')}<svg className="h-3 w-3" viewBox="0 0 12 12" fill="currentColor"><path d="M6 8L2 4h8L6 8z" /></svg>
               </button>
               {menuOpen && (
@@ -360,12 +440,12 @@ export default function App() {
           {(isSummarizing || streamPaused) && (
             <div className="flex items-center gap-2 px-4 py-2 border-b border-neutral-100 dark:border-neutral-800 transition-colors duration-200">
               {isSummarizing && (
-                <button onClick={handlePauseStream} className={btn}>
+                <button onClick={handlePauseStream} className={btn} aria-label={t('pause')}>
                   ⏸ {t('pause')}
                 </button>
               )}
               {streamPaused && (
-                <button onClick={handleContinue} className={btn}>
+                <button onClick={handleContinue} className={btn} aria-label={t('continue_')}>
                   ▶ {t('continue_')}
                 </button>
               )}
@@ -382,13 +462,13 @@ export default function App() {
 
           {showRawText && article && (
             <div className="border-b border-neutral-200 dark:border-neutral-800 px-4 py-3">
-              <pre className="text-xs text-neutral-600 dark:text-neutral-400 whitespace-pre-wrap max-h-64 overflow-y-auto leading-relaxed">{article.rawText || '(No text)'}</pre>
+              <pre className="text-xs text-neutral-600 dark:text-neutral-400 whitespace-pre-wrap max-h-64 overflow-y-auto leading-relaxed">{article.rawText || t('noText')}</pre>
             </div>
           )}
 
           {displayedMarkdown && (<>
             <div className="flex items-center gap-2 px-4 pt-3">
-              <span className="text-xs text-neutral-500 dark:text-neutral-600 uppercase tracking-wider">{styleLabel(activeStyle)} summary{bilingual && t('bilingualIndicator')}</span>
+              <span className="text-xs text-neutral-500 dark:text-neutral-600 uppercase tracking-wider">{styleLabel(activeStyle)} {t('summaryLabel')}{bilingual && t('bilingualIndicator')}</span>
               {isStyleCached && <span className="text-xs text-neutral-400 dark:text-neutral-700">({t('cached')})</span>}
               {isSummarizing && <span className="text-xs text-neutral-500 animate-pulse">{t('streaming')}</span>}
             </div>
@@ -415,22 +495,74 @@ export default function App() {
           {history.length === 0 ? (
             <div className="px-4 py-8 text-center"><p className="text-sm text-neutral-500">{t('noHistory')}</p></div>
           ) : (<>
-            <p className="px-4 py-2 text-xs font-medium text-neutral-500 dark:text-neutral-600 uppercase tracking-wider">{t('history')}（{history.length}）</p>
-            {history.map((entry) => (
-              <div key={entry.id} className="group flex items-center border-b border-neutral-200/50 dark:border-neutral-800/50 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors duration-200">
-                <button onClick={() => handleHistoryClick(entry)} className="flex-1 text-left px-4 py-2 min-w-0">
-                  <p className="text-xs text-neutral-700 dark:text-neutral-300 truncate">{entry.title}</p>
-                  <div className="flex items-center gap-2 mt-0.5">
-                    <span className="text-xs text-neutral-500 dark:text-neutral-600">{styleLabel(entry.style)}</span>
-                    <span className="text-xs text-neutral-400 dark:text-neutral-700">{formatTime(entry.timestamp, lang)}</span>
-                  </div>
-                </button>
-                <button onClick={() => handleDeleteHistoryEntry(entry.id)}
-                  className="shrink-0 px-2 py-2 text-neutral-400 hover:text-red-500 dark:hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all" title={t('delete')}>
-                  <TrashIcon />
-                </button>
+            {/* Search and batch controls */}
+            <div className="px-4 py-2 border-b border-neutral-100 dark:border-neutral-800 space-y-2 transition-colors duration-200">
+              <div className="relative">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => handleSearchChange(e.target.value)}
+                  placeholder={t('searchHistory')}
+                  className="w-full rounded-md border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-800 px-3 py-1.5 pl-8 text-xs text-neutral-800 dark:text-neutral-200 placeholder-neutral-400 focus:outline-none focus:border-neutral-400 transition-colors duration-200"
+                />
+                <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-neutral-400" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <circle cx="5" cy="5" r="3.5" />
+                  <path d="M8 8l3 3" strokeLinecap="round" />
+                </svg>
               </div>
-            ))}
+              <div className="flex items-center gap-2">
+                <button onClick={handleSelectAll} className={btn}>
+                  {selectedIds.size === filteredHistory.length ? t('deselectAll') : t('selectAll')}
+                </button>
+                {selectedIds.size > 0 && (
+                  <>
+                    <button onClick={handleBatchDelete} className={`${btn} border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20`}>
+                      {t('batchDelete')} ({selectedIds.size})
+                    </button>
+                    <button onClick={handleBatchExport} className={btn}>
+                      {t('batchExport')} ({selectedIds.size})
+                    </button>
+                  </>
+                )}
+                {selectedIds.size === 0 && (
+                  <button onClick={handleBatchExport} className={btn}>
+                    {t('exportAllHistory')}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <p className="px-4 py-2 text-xs font-medium text-neutral-500 dark:text-neutral-600 uppercase tracking-wider">
+              {t('history')}{lang === 'zh' ? '（' : '('}{filteredHistory.length}{searchQuery ? ` / ${history.length}` : ''}{lang === 'zh' ? '）' : ')'}
+            </p>
+            {filteredHistory.length === 0 ? (
+              <div className="px-4 py-8 text-center"><p className="text-sm text-neutral-500">{t('noResults')}</p></div>
+            ) : (
+              filteredHistory.map((entry) => (
+                <div key={entry.id} className="group flex items-center border-b border-neutral-200/50 dark:border-neutral-800/50 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-colors duration-200">
+                  <div className="shrink-0 px-2 py-2">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(entry.id)}
+                      onChange={() => handleToggleSelect(entry.id)}
+                      className="h-3 w-3 rounded border-neutral-300 dark:border-neutral-700 text-blue-600 focus:ring-blue-500"
+                      aria-label={t('delete')}
+                    />
+                  </div>
+                  <button onClick={() => handleHistoryClick(entry)} className="flex-1 text-left px-2 py-2 min-w-0">
+                    <p className="text-xs text-neutral-700 dark:text-neutral-300 truncate">{entry.title}</p>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className="text-xs text-neutral-500 dark:text-neutral-600">{styleLabel(entry.style)}</span>
+                      <span className="text-xs text-neutral-400 dark:text-neutral-700">{formatTime(entry.timestamp, lang, t)}</span>
+                    </div>
+                  </button>
+                  <button onClick={() => handleDeleteHistoryEntry(entry.id)}
+                    className="shrink-0 px-2 py-2 text-neutral-400 hover:text-red-500 dark:hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all" title={t('delete')} aria-label={t('delete')}>
+                    <TrashIcon />
+                  </button>
+                </div>
+              ))
+            )}
             <div className="px-4 py-3">
               <button onClick={handleClearHistory} className="text-xs text-red-500 hover:text-red-400 transition-colors">{t('clearHistory')}</button>
             </div>
@@ -494,7 +626,8 @@ export default function App() {
           <label className="flex items-center justify-between">
             <span className="text-xs text-neutral-500">{t('autoTranslate')}</span>
             <button onClick={() => setAutoTranslateTitle((v) => !v)}
-              className={`rounded-full w-8 h-4 transition-colors duration-200 ${autoTranslateTitle ? 'bg-blue-600' : 'bg-neutral-400 dark:bg-neutral-600'}`}>
+              className={`rounded-full w-8 h-4 transition-colors duration-200 ${autoTranslateTitle ? 'bg-blue-600' : 'bg-neutral-400 dark:bg-neutral-600'}`}
+              role="switch" aria-checked={autoTranslateTitle} aria-label={t('autoTranslate')}>
               <span className={`block w-3 h-3 rounded-full bg-white transition-transform duration-200 mx-0.5 ${autoTranslateTitle ? 'translate-x-4' : ''}`} />
             </button>
           </label>
@@ -533,7 +666,7 @@ export default function App() {
           <button key={key} onClick={() => setActiveTab(key as Tab)}
             className={`flex-1 flex flex-col items-center py-1.5 text-xs transition-colors duration-200 ${
               activeTab === key ? 'text-blue-600 dark:text-blue-400' : 'text-neutral-400 dark:text-neutral-600 hover:text-neutral-600 dark:hover:text-neutral-400'
-            }`}>
+            }`} aria-label={label} aria-selected={activeTab === key} role="tab">
             <span className="text-sm">{icon}</span><span>{label}</span>
           </button>
         ))}
@@ -595,12 +728,12 @@ function TrashIcon() {
   return <svg className="h-3 w-3" viewBox="0 0 12 12" fill="currentColor"><path d="M4 1.5h4l.5.5H10v1H2V2h1.5l.5-.5zM3 4l.5 6.5h5L9 4H3z" /></svg>;
 }
 
-function formatTime(ts: number, lang: string): string {
+function formatTime(ts: number, lang: string, t: (key: string) => string): string {
   const d = new Date(ts);
   const diffMin = Math.floor((Date.now() - d.getTime()) / 60000);
-  if (diffMin < 1) return lang === 'zh' ? '刚刚' : 'just now';
-  if (diffMin < 60) return lang === 'zh' ? `${diffMin} 分钟前` : `${diffMin}m ago`;
+  if (diffMin < 1) return t('justNow');
+  if (diffMin < 60) return t('minutesAgo').replace('{n}', String(diffMin));
   const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return lang === 'zh' ? `${diffHr} 小时前` : `${diffHr}h ago`;
+  if (diffHr < 24) return t('hoursAgo').replace('{n}', String(diffHr));
   return d.toLocaleDateString(lang === 'zh' ? 'zh-CN' : 'en-US');
 }

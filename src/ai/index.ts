@@ -1,1 +1,4 @@
-export { generateSummaryStream, testConnection, PROVIDERS } from './client';
+export {
+  generateSummaryStream, testConnection, PROVIDERS, isAnthropicUrl,
+  buildAnthropicHeaders, buildAnthropicEndpoint, buildAnthropicBody,
+} from './client';

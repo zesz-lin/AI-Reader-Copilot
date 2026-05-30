@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 
 marked.setOptions({ breaks: true, gfm: true });
 
@@ -8,7 +9,10 @@ interface Props {
 }
 
 export default function MarkdownView({ content }: Props) {
-  const html = useMemo(() => marked.parse(content) as string, [content]);
+  const html = useMemo(() => {
+    const raw = marked.parse(content) as string;
+    return DOMPurify.sanitize(raw);
+  }, [content]);
 
   return (
     <div

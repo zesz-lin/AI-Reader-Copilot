@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { createContext, useCallback, useContext, useState } from 'react';
 
 export type Lang = 'zh' | 'en';
 
@@ -73,6 +73,31 @@ const DICT: Record<string, { zh: string; en: string }> = {
   paywallHint:         { zh: '遇到了讨厌的付费墙?试试离线存档!↓', en: 'Happened to a paywall? Try offline saving!↓' },
   tabArticle:          { zh: '文章',               en: 'Article' },
   tabSettings:         { zh: '设置',               en: 'Settings' },
+  searchHistory:       { zh: '搜索历史…',          en: 'Search history…' },
+  selectAll:           { zh: '全选',               en: 'Select All' },
+  deselectAll:         { zh: '取消全选',           en: 'Deselect All' },
+  batchDelete:         { zh: '删除选中',           en: 'Delete Selected' },
+  batchExport:         { zh: '导出选中',           en: 'Export Selected' },
+  exportAllHistory:    { zh: '导出全部历史',       en: 'Export All History' },
+  selectedCount:       { zh: '已选 {count} 项',    en: '{count} selected' },
+  noResults:           { zh: '没有匹配的记录',     en: 'No matching records' },
+  confirmDelete:       { zh: '确定删除选中的 {count} 条记录？', en: 'Delete {count} selected records?' },
+  confirmClearAll:     { zh: '确定清空所有历史记录？', en: 'Clear all history?' },
+  noText:              { zh: '（无文本）',           en: '(No text)' },
+  summaryLabel:        { zh: '摘要',               en: 'summary' },
+  exportUrl:           { zh: '链接',               en: 'URL' },
+  exportStyle:         { zh: '风格',               en: 'Style' },
+  exportDate:          { zh: '日期',               en: 'Date' },
+  justNow:             { zh: '刚刚',               en: 'just now' },
+  minutesAgo:          { zh: '{n} 分钟前',          en: '{n}m ago' },
+  hoursAgo:            { zh: '{n} 小时前',          en: '{n}h ago' },
+  noArticleDetected:   { zh: '该页面未检测到文章',   en: 'No article detected on this page' },
+  noArticleToSummarize:{ zh: '没有可摘要的文章',     en: 'No article to summarize.' },
+  noActiveTab:         { zh: '没有活动标签页',       en: 'No active tab found.' },
+  articleTruncated:    { zh: '[文章已截断]',         en: '[Article truncated]' },
+  apiNoKey:            { zh: 'API 密钥未配置',       en: 'API key not configured.' },
+  apiNoText:           { zh: '文章无文本内容',       en: 'Article has no text content.' },
+  apiError:            { zh: 'API 错误 {status}',    en: 'API error {status}' },
 };
 
 export const STYLE_LABELS: Record<string, { zh: string; en: string }> = {

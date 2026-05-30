@@ -4,7 +4,10 @@ import type {
   ArticleRecord, SidePanelMessage, SummaryStyle,
 } from '../shared';
 import { saveToHistory, getHistory, clearHistory, deleteFromHistory } from '../shared';
-import { generateSummaryStream } from '../ai';
+import {
+  generateSummaryStream, isAnthropicUrl,
+  buildAnthropicHeaders, buildAnthropicEndpoint, buildAnthropicBody,
+} from '../ai';
 
 
 // ── Language ──────────────────────────────────────────────────────────
@@ -103,6 +106,20 @@ chrome.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
 let lastArticle: ArticleRecord | null = null;
 let streamAbortController: AbortController | null = null;
 
+// ── Stream abort on side panel close ──────────────────────────────────
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === 'side-panel') {
+    port.onDisconnect.addListener(() => {
+      if (streamAbortController) {
+        console.log('[ai-reader-copilot] Side panel disconnected, aborting stream');
+        streamAbortController.abort();
+        streamAbortController = null;
+      }
+    });
+  }
+});
+
 // ── Archive redirect ─────────────────────────────────────────────────
 
 async function redirectToArchive(targetUrl: string): Promise<void> {
@@ -131,19 +148,21 @@ async function maybeTranslateTitle(title: string): Promise<void> {
     const baseUrl = (result.baseUrl as string) || 'https://api.deepseek.com/v1';
     const model = (result.model as string) || 'deepseek-reasoner';
 
-    const anthropic = /\banthropic\.(com|net)\b/.test(baseUrl);
+    const anthropic = isAnthropicUrl(baseUrl);
 
     let translated: string | undefined;
 
     if (anthropic) {
-      const res = await fetch(`${baseUrl}/v1/messages`, {
+      const res = await fetch(buildAnthropicEndpoint(baseUrl), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({
+        headers: buildAnthropicHeaders(apiKey),
+        body: buildAnthropicBody({
+          baseUrl,
+          apiKey,
           model,
-          max_tokens: 100,
           system: 'Translate the following title to Chinese. Output only the translation, nothing else.',
           messages: [{ role: 'user', content: title }],
+          maxTokens: 100,
           temperature: 0,
         }),
       });
@@ -275,7 +294,7 @@ chrome.runtime.onMessage.addListener(
         (async () => {
           try {
             if (!lastArticle) {
-              sendResponse({ status: 'error', error: '没有可摘要的文章\nNo article to summarize.' } satisfies SummaryResponse);
+              sendResponse({ status: 'error', error: t(ERR_DICT.noArticle.zh, ERR_DICT.noArticle.en) } satisfies SummaryResponse);
               return;
             }
 
@@ -303,7 +322,7 @@ chrome.runtime.onMessage.addListener(
           try {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             if (!tab?.id) {
-              sendResponse({ status: 'error', error: '没有活动标签页\nNo active tab found.' });
+              sendResponse({ status: 'error', error: t(ERR_DICT.noActiveTab.zh, ERR_DICT.noActiveTab.en) });
               return;
             }
 
@@ -323,7 +342,7 @@ chrome.runtime.onMessage.addListener(
                 };
                 sendResponse({ status: 'ok', article: lastArticle });
               } else {
-                sendResponse({ status: 'error', error: response?.error || '提取失败\nExtraction failed.' });
+                sendResponse({ status: 'error', error: response?.error || t(ERR_DICT.extractFail.zh, ERR_DICT.extractFail.en) });
               }
             });
           } catch (err) {
@@ -376,7 +395,7 @@ chrome.runtime.onMessage.addListener(
 
       default: {
         const _exhaustive: never = message;
-        sendResponse({ status: 'error', error: '未知消息类型\nUnknown message type.' } satisfies AppResponse);
+        sendResponse({ status: 'error', error: t(ERR_DICT.unknownMsg.zh, ERR_DICT.unknownMsg.en) } satisfies AppResponse);
       }
     }
   },

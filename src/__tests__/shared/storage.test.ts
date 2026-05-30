@@ -28,9 +28,9 @@ async function countHistory(): Promise<number> {
   return (await getHistory()).length;
 }
 
-// Helper to check ID format: timestamp-random6chars
+// Helper to check ID format: UUID v4
 function isValidId(id: string): boolean {
-  return /^\d{13}-[0-9a-z]{6}$/.test(id);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
 }
 
 describe('saveToHistory', () => {

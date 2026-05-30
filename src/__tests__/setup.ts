@@ -48,6 +48,10 @@ const mockRuntime = {
     removeListener: vi.fn(),
   },
   sendMessage: vi.fn(),
+  connect: vi.fn().mockReturnValue({
+    onDisconnect: { addListener: vi.fn() },
+    disconnect: vi.fn(),
+  }),
   lastError: null as Error | null,
 };
 
@@ -103,6 +107,22 @@ Object.defineProperty(window, 'matchMedia', {
     dispatchEvent: vi.fn(),
   })),
 });
+
+// ── crypto.randomUUID polyfill (jsdom does not implement it) ────────────
+
+if (typeof globalThis.crypto === 'undefined' || !globalThis.crypto.randomUUID) {
+  const mockUUID = () => {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === 'x' ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  };
+  Object.defineProperty(globalThis, 'crypto', {
+    value: { randomUUID: mockUUID },
+    writable: true,
+  });
+}
 
 // ── Jest/Vitest global type extension ──────────────────────────────────
 

@@ -85,7 +85,6 @@ export function unhidePaywalledContent(doc: Document): void {
   );
 
   for (const el of articleCandidates) {
-    const style = (el as HTMLElement).style;
     const computed = (el as HTMLElement).style; // inline only
 
     // Remove display:none from article containers
